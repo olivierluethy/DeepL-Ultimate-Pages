@@ -64,16 +64,21 @@
         "use strict";
 
         // ─────────────────────────────────────────────────────────────
-        // CONFIG — verify before publishing. The PostHog values are the
-        // project's PUBLIC ingestion key + host (safe in a public repo);
-        // the survey URL is where the user lands after the ping.
+        // CONFIG — verify before publishing. PostHog values are the
+        // project's PUBLIC ingestion key + region host (safe in a public
+        // repo); the survey URL is where the user lands after the ping.
         // ─────────────────────────────────────────────────────────────
         var POSTHOG_KEY = "phc_vdh5V2RdTvv78E778stRjmNqXf7LNwEEhPhHteafYvLG"; // FILL IN / VERIFY: PostHog PUBLIC project API key (write-only). NEVER a personal/private key.
-        var POSTHOG_HOST = "https://eu.i.posthog.com"; // FILL IN / VERIFY: PostHog host (region)
+        var POSTHOG_HOST = "https://eu.i.posthog.com"; // FILL IN / VERIFY: region host. EU Cloud = https://eu.i.posthog.com · US Cloud = https://us.i.posthog.com
         var SURVEY_URL = "https://forms.gle/cFNf17u5CxSQ8d6t6"; // FILL IN: Google Form (uninstall survey)
-        var MAX_WAIT_MS = 1500; // hard ceiling — never strand the user if ingestion is slow
 
-        document.getElementById("manualLink").setAttribute("href", SURVEY_URL);
+        var CAPTURE_PATH = "/i/v0/e/"; // PostHog single-event ingestion endpoint
+        var REDIRECT_MS = 1200;        // show the loader briefly; sendBeacon is already queued by now
+        var MAX_WAIT_MS = 1500;        // hard ceiling — never strand the user
+
+        // Optional local diagnostics: open  uninstall.html?d=...&debug=1
+        var debug = false;
+        try { debug = new URLSearchParams(location.search).get("debug") === "1"; } catch (e) {}
 
         function param(name) {
           try { return new URLSearchParams(location.search).get(name) || ""; }
@@ -81,12 +86,14 @@
         }
         function intOrNull(s) { var n = parseInt(s, 10); return isNaN(n) ? null : n; }
 
-        // The whole point: reuse the EXACT distinct_id the extension reported,
-        // so this event stitches onto that user's prior event history.
+        // The whole point of stitching: reuse the EXACT distinct_id the
+        // extension embedded (?d=...), so this lands on that user's history.
         var distinctId = param("d");
         var version = param("v");
         var mainCompleted = intOrNull(param("mc"));
         var docsCompleted = intOrNull(param("dc"));
+
+        document.getElementById("manualLink").setAttribute("href", SURVEY_URL);
 
         var redirected = false;
         function redirect() {
@@ -94,62 +101,61 @@
           redirected = true;
           location.replace(SURVEY_URL);
         }
-        // Guaranteed redirect, even if PostHog is blocked or slow.
-        var timer = setTimeout(redirect, MAX_WAIT_MS);
 
-        function fireUninstallEvent() {
-          if (!distinctId) return false; // can't stitch without it — still redirect via timer
+        var endpoint = POSTHOG_HOST.replace(/\/+$/, "") + CAPTURE_PATH;
 
-          var payload = {
-            api_key: POSTHOG_KEY,
-            event: "extension_uninstalled",
-            distinct_id: distinctId,
-            properties: {
-              distinct_id: distinctId,
-              extension_version: version || "unknown",
-              main_translations_completed: mainCompleted,
-              documents_completed: docsCompleted,
-              $lib: "uninstall-page",
-              browser_language: navigator.language,
-              $current_url: location.href
-            },
-            timestamp: new Date().toISOString()
-          };
+        // PostHog capture shape: api_key + event + distinct_id (+ properties).
+        var payload = {
+          api_key: POSTHOG_KEY,
+          event: "extension_uninstalled",
+          distinct_id: distinctId || "anonymous_uninstall",
+          properties: {
+            distinct_id: distinctId || "anonymous_uninstall",
+            extension_version: version || "unknown",
+            main_translations_completed: mainCompleted,
+            documents_completed: docsCompleted,
+            had_distinct_id: !!distinctId,
+            $lib: "uninstall-page",
+            browser_language: navigator.language,
+            $current_url: location.href
+          },
+          timestamp: new Date().toISOString()
+        };
+        var body = JSON.stringify(payload);
 
-          var endpoint = POSTHOG_HOST.replace(/\/+$/, "") + "/e/";
-          var body = JSON.stringify(payload);
+        // Transport that SURVIVES navigation — the redirect cannot cancel it.
+        var beaconOk = false;
+        try {
+          if (navigator.sendBeacon) {
+            beaconOk = navigator.sendBeacon(endpoint, new Blob([body], { type: "application/json" }));
+          }
+        } catch (e) { beaconOk = false; }
 
-          // Preferred: sendBeacon — queued synchronously, survives navigation.
-          try {
-            if (navigator.sendBeacon &&
-                navigator.sendBeacon(endpoint, new Blob([body], { type: "application/json" }))) {
-              return true;
-            }
-          } catch (e) { /* fall through */ }
-
-          // Fallback: keepalive fetch (also survives navigation).
+        // Fallback (also survives navigation) if the browser refused the beacon.
+        if (!beaconOk) {
           try {
             fetch(endpoint, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: body,
-              keepalive: true,
-              mode: "no-cors"
-            }).then(function () {
-              clearTimeout(timer);
-              setTimeout(redirect, 200);
-            }).catch(function () { /* timer handles it */ });
-            return true;
-          } catch (e) { return false; }
+              keepalive: true
+            }).catch(function () {});
+          } catch (e) {}
         }
 
-        var sent = fireUninstallEvent();
-        if (sent) {
-          // Event is on its way; show the screen briefly, then go.
-          clearTimeout(timer);
-          setTimeout(redirect, 600);
+        if (debug) {
+          // Diagnostic mode: log everything and DO NOT redirect, so you can
+          // inspect Network → request to /i/v0/e/ and confirm it isn't canceled.
+          console.log("[uninstall] endpoint:", endpoint);
+          console.log("[uninstall] sendBeacon returned:", beaconOk, "(false = browser refused to queue)");
+          console.log("[uninstall] distinct_id:", payload.distinct_id, "| had_distinct_id:", payload.properties.had_distinct_id);
+          console.log("[uninstall] payload:", payload);
+          console.log("[uninstall] redirect suppressed (debug=1). Click the survey link when done.");
+          return;
         }
-        // If !sent (e.g. missing distinct_id), MAX_WAIT_MS timer still redirects.
+
+        setTimeout(redirect, REDIRECT_MS);
+        setTimeout(redirect, MAX_WAIT_MS);
       })();
     </script>
   </body>
